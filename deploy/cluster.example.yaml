@@ -1,0 +1,31 @@
+# agenkit-runtime cluster configuration example
+#
+# Copy to /etc/agenkit/cluster.yaml and edit to match your environment.
+# Run `agenkit-runtime cluster provision` after editing.
+
+# snapshot_store is the shared location for Firecracker VM snapshots and
+# migration data. May be a local NFS mount or an S3 URL.
+snapshot_store: /mnt/nas/agenkit-snapshots
+# snapshot_store: s3://my-bucket/agenkit-snapshots
+
+# kernel_path is the path to the guest vmlinux on each host.
+# All hosts must have this file at the same path.
+kernel_path: /var/agenkit/vmlinux
+
+hosts:
+  # Local host example: an existing machine reachable via SSH.
+  - type: local
+    addr: kamrui-01.local
+    user: scott
+    pool_size: 4
+
+  # EC2 spot instance example: auto-scaling with up to 3 instances.
+  - type: ec2
+    region: us-west-2
+    instance_type: c8i.xlarge
+    spot: true
+    pool_size: 8
+    auto: true
+    scale_up_threshold: 0.8    # scale up when >80% of slots are occupied
+    scale_down_after: 10m      # terminate idle instance after 10 minutes
+    max_instances: 3
