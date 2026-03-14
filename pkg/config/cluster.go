@@ -91,6 +91,8 @@ type HostState struct {
 	PoolSize int `json:"pool_size"`
 	// ProvisionedAt is when the host was last bootstrapped.
 	ProvisionedAt time.Time `json:"provisioned_at"`
+	// Drained indicates the host has been drained and should not receive new sessions.
+	Drained bool `json:"drained,omitempty"`
 }
 
 // LoadState reads the cluster state from path.

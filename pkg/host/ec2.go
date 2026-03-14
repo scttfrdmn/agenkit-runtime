@@ -138,6 +138,9 @@ func (h *EC2Host) waitUntilRunning(ctx context.Context) error {
 	return fmt.Errorf("timed out waiting for instance %s to start", h.instanceID)
 }
 
+// InstanceID returns the EC2 instance ID (empty until Provision is called).
+func (h *EC2Host) InstanceID() string { return h.instanceID }
+
 // Address returns the public DNS name of the instance.
 func (h *EC2Host) Address() string { return h.publicDNS }
 
