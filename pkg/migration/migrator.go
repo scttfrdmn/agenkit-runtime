@@ -2,8 +2,11 @@ package migration
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"log"
+	"os"
+	"path/filepath"
 	"time"
 
 	"github.com/scttfrdmn/agenkit-runtime/pkg/vsock"
@@ -27,6 +30,9 @@ type Migrator struct {
 	MigrationID string
 	// Reason is the interruption reason ("spot_warning" | "drain" | "user").
 	Reason string
+	// ManifestDir is the directory where migration manifests are persisted.
+	// If empty, manifests are not written to disk.
+	ManifestDir string
 }
 
 // MigrateAll sends checkpoint signals to all active VMs and collects their
@@ -100,5 +106,35 @@ func (m *Migrator) MigrateAll(ctx context.Context, activeSessions map[int]string
 		manifest.Sessions = append(manifest.Sessions, sm)
 	}
 
+	if m.ManifestDir != "" {
+		if err := writeManifest(m.ManifestDir, manifest); err != nil {
+			log.Printf("WARNING: migration: failed to persist manifest %s: %v", m.MigrationID, err)
+		} else {
+			log.Printf("INFO: migration: manifest %s written to %s", m.MigrationID, m.ManifestDir)
+		}
+	}
+
 	return manifest, nil
+}
+
+// writeManifest atomically writes a MigrationManifest to dir as
+// {migration_id}.json using a write-then-rename pattern.
+func writeManifest(dir string, m *MigrationManifest) error {
+	if err := os.MkdirAll(dir, 0755); err != nil {
+		return fmt.Errorf("failed to create manifest dir %s: %w", dir, err)
+	}
+	data, err := json.MarshalIndent(m, "", "  ")
+	if err != nil {
+		return fmt.Errorf("failed to marshal manifest: %w", err)
+	}
+	tmp := filepath.Join(dir, m.MigrationID+".json.tmp")
+	if err := os.WriteFile(tmp, data, 0600); err != nil {
+		return fmt.Errorf("failed to write manifest tmp file: %w", err)
+	}
+	dest := filepath.Join(dir, m.MigrationID+".json")
+	if err := os.Rename(tmp, dest); err != nil {
+		_ = os.Remove(tmp)
+		return fmt.Errorf("failed to rename manifest file: %w", err)
+	}
+	return nil
 }

@@ -2,6 +2,9 @@ package internal
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/hex"
+	"fmt"
 	"log"
 	"os"
 	"os/signal"
@@ -68,14 +71,68 @@ func runServe(ctx context.Context) error {
 		snapshotMgr = snapshot.NewManager(store, os.TempDir())
 	}
 
-	// Start the spot monitor (no-op on non-EC2).
-	spotMon := migration.NewSpotMonitor(func(deadline time.Time) {
-		log.Printf("WARNING: spot interruption detected, deadline %s — initiating migration", deadline)
-		// In a full implementation, this would trigger MigrateAll for all active VMs.
-	})
-
+	// Create a cancellable context for the monitor and API server.
 	monCtx, monCancel := context.WithCancel(ctx)
 	defer monCancel()
+
+	// Start the spot monitor (no-op on non-EC2).
+	manifestDir := snapshotDir + "/manifests"
+	spotMon := migration.NewSpotMonitor(func(deadline time.Time) {
+		log.Printf("WARNING: spot interruption detected, deadline %s — initiating migration", deadline)
+
+		// Collect active sessions and vsock addresses from all pools.
+		activeSessions := make(map[int]string)
+		vmAddrs := make(map[int]string)
+		for _, p := range pools {
+			for slotIdx, sessionID := range p.ActiveSessions() {
+				activeSessions[slotIdx] = sessionID
+				vmAddrs[slotIdx] = fmt.Sprintf("vsock:%d", slotIdx+3)
+			}
+		}
+		if len(activeSessions) == 0 {
+			log.Printf("INFO: spot interruption: no active sessions to migrate")
+			return
+		}
+
+		// Generate a random migration ID (16 bytes of hex — no external uuid dep).
+		var raw [16]byte
+		if _, err := rand.Read(raw[:]); err != nil {
+			log.Printf("ERROR: migration: failed to generate migration ID: %v", err)
+			return
+		}
+		migrationID := hex.EncodeToString(raw[:])
+
+		// Resolve local host address from config (first host entry as a best-effort default).
+		hostAddr := "localhost"
+		if len(cfg.Hosts) > 0 && cfg.Hosts[0].Addr != "" {
+			hostAddr = cfg.Hosts[0].Addr
+		}
+
+		migrator := &migration.Migrator{
+			HostAddr:    hostAddr,
+			VMAddrs:     vmAddrs,
+			MigrationID: migrationID,
+			Reason:      "spot_warning",
+			ManifestDir: manifestDir,
+		}
+
+		go func() {
+			manifest, err := migrator.MigrateAll(monCtx, activeSessions, deadline)
+			if err != nil {
+				log.Printf("ERROR: migration %s: MigrateAll failed: %v", migrationID, err)
+				return
+			}
+			pending := 0
+			for _, s := range manifest.Sessions {
+				if s.Status == "pending" {
+					pending++
+				}
+			}
+			log.Printf("INFO: migration %s complete: %d/%d sessions pending recovery",
+				migrationID, pending, len(manifest.Sessions))
+		}()
+	})
+
 	go spotMon.Run(monCtx)
 
 	// Start the Unix socket API server.

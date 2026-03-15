@@ -68,6 +68,20 @@ func (p *Pool) Drain(ctx context.Context, mode DrainMode) {
 	}
 }
 
+// ActiveSessions returns a map of slot index to session ID for all VMs
+// that currently have an assigned session.
+func (p *Pool) ActiveSessions() map[int]string {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	m := make(map[int]string)
+	for _, vm := range p.vms {
+		if vm.sessionID != "" {
+			m[vm.slotIndex] = vm.sessionID
+		}
+	}
+	return m
+}
+
 // Stats returns a snapshot of per-state VM counts.
 func (p *Pool) Stats() map[VMState]int {
 	p.mu.Lock()
