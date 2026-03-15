@@ -93,6 +93,9 @@ type HostState struct {
 	ProvisionedAt time.Time `json:"provisioned_at"`
 	// Drained indicates the host has been drained and should not receive new sessions.
 	Drained bool `json:"drained,omitempty"`
+	// VMStates records the last-known state of each VM slot.
+	// Index i corresponds to pool slot i. Empty string means the slot is absent.
+	VMStates []string `json:"vm_states,omitempty"`
 }
 
 // LoadState reads the cluster state from path.

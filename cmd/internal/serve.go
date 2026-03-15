@@ -51,18 +51,50 @@ func runServe(ctx context.Context) error {
 	log.Printf("INFO: agenkit-runtime serve starting with %d host(s)", len(cfg.Hosts))
 	log.Printf("INFO: cluster state: %d known hosts", len(state.Hosts))
 
-	// Build per-host pools from state.
+	// Build per-host pools from state and pre-warm slots that were ready
+	// at last shutdown (as recorded in VMStates).
 	pools := make(map[string]*pool.Pool, len(state.Hosts))
 	for addr, hs := range state.Hosts {
-		pools[addr] = pool.NewPool(hs.PoolSize)
+		p := pool.NewPool(hs.PoolSize)
+		pools[addr] = p
+
+		// Pre-warm: transition slots from absent→provisioned→ready for every
+		// slot that was in the "ready" state at last shutdown (as persisted
+		// in VMStates).  PID 0 is used as a placeholder — the real PID is
+		// not known until the Firecracker process is (re-)started, which is
+		// handled by the provisioning flow.  This restores pool availability
+		// so the daemon can accept sessions immediately after a restart.
+		for i, stateStr := range hs.VMStates {
+			if i >= p.Size() {
+				break
+			}
+			if pool.VMState(stateStr) != pool.VMStateReady {
+				continue
+			}
+			if provErr := p.VM(i).Provision(0); provErr != nil {
+				log.Printf("WARNING: pre-warm slot %d on %s: provision: %v", i, addr, provErr)
+				continue
+			}
+			if markErr := p.VM(i).MarkReady(); markErr != nil {
+				log.Printf("WARNING: pre-warm slot %d on %s: mark ready: %v", i, addr, markErr)
+				continue
+			}
+			log.Printf("INFO: pre-warmed pool slot %d on %s (was ready at last shutdown)", i, addr)
+		}
 	}
 
-	// Build snapshot manager (uses local store).
+	// Build snapshot manager using NewStoreFromURL so s3:// and local paths
+	// are both supported without changes to the config schema.
 	snapshotDir := cfg.SnapshotStore
 	if snapshotDir == "" {
 		snapshotDir = "/var/lib/agenkit/snapshots"
 	}
-	store, err := snapshot.NewLocalStore(snapshotDir)
+
+	// Create a cancellable context for the monitor and API server.
+	monCtx, monCancel := context.WithCancel(ctx)
+	defer monCancel()
+
+	store, err := snapshot.NewStoreFromURL(monCtx, snapshotDir)
 	if err != nil {
 		log.Printf("WARNING: failed to create snapshot store at %s: %v", snapshotDir, err)
 	}
@@ -70,10 +102,6 @@ func runServe(ctx context.Context) error {
 	if store != nil {
 		snapshotMgr = snapshot.NewManager(store, os.TempDir())
 	}
-
-	// Create a cancellable context for the monitor and API server.
-	monCtx, monCancel := context.WithCancel(ctx)
-	defer monCancel()
 
 	// Start the spot monitor (no-op on non-EC2).
 	manifestDir := snapshotDir + "/manifests"
@@ -164,6 +192,25 @@ func runServe(ctx context.Context) error {
 	case sig := <-sigCh:
 		log.Printf("INFO: received signal %s, shutting down", sig)
 	case <-ctx.Done():
+	}
+
+	// Persist VM states before shutdown so the next start can pre-warm correctly.
+	for addr, p := range pools {
+		if hs, ok := state.Hosts[addr]; ok {
+			vmStates := make([]string, p.Size())
+			for i := range vmStates {
+				vmStates[i] = string(p.VM(i).State())
+			}
+			hs.VMStates = vmStates
+		}
+	}
+
+	// Drain all pools with a 30-second graceful timeout.
+	drainCtx, drainCancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer drainCancel()
+	for addr, p := range pools {
+		log.Printf("INFO: draining pool for host %s (%d active sessions)", addr, len(p.ActiveSessions()))
+		p.Drain(drainCtx, pool.DrainGraceful)
 	}
 
 	// Persist final state.

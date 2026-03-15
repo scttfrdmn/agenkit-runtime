@@ -10,6 +10,24 @@ import (
 	"strings"
 )
 
+// NewStoreFromURL creates a SnapshotStore from a URL string.
+// Supported schemes:
+//   - "s3://bucket/prefix" → S3SnapshotStore (credentials from AWS default chain)
+//   - local path (no scheme) → LocalStore
+func NewStoreFromURL(ctx context.Context, rawURL string) (SnapshotStore, error) {
+	if strings.HasPrefix(rawURL, "s3://") {
+		rest := strings.TrimPrefix(rawURL, "s3://")
+		parts := strings.SplitN(rest, "/", 2)
+		bucket := parts[0]
+		prefix := ""
+		if len(parts) == 2 {
+			prefix = parts[1]
+		}
+		return NewS3Store(ctx, bucket, prefix)
+	}
+	return NewLocalStore(rawURL)
+}
+
 // SnapshotStore is the interface for storing and retrieving Firecracker snapshots.
 type SnapshotStore interface {
 	// Push uploads a snapshot directory to the store.

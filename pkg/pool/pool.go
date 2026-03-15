@@ -25,6 +25,10 @@ func NewPool(size int) *Pool {
 // Size returns the total number of slots.
 func (p *Pool) Size() int { return len(p.vms) }
 
+// VM returns the VM at slot index i.
+// The caller must not mutate the returned VM concurrently with Pool operations.
+func (p *Pool) VM(i int) *VM { return p.vms[i] }
+
 // Available returns the number of VMs currently in the ready state.
 func (p *Pool) Available() int {
 	p.mu.Lock()
