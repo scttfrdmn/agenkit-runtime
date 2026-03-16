@@ -5,23 +5,30 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"fmt"
-	"log"
+	"log/slog"
+	"net/http"
 	"os"
 	"os/signal"
 	"syscall"
 	"time"
 
+	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"github.com/spf13/cobra"
+
 	"github.com/scttfrdmn/agenkit-runtime/cmd/internal/handlers"
 	"github.com/scttfrdmn/agenkit-runtime/pkg/api"
 	"github.com/scttfrdmn/agenkit-runtime/pkg/config"
+	"github.com/scttfrdmn/agenkit-runtime/pkg/metrics"
 	"github.com/scttfrdmn/agenkit-runtime/pkg/migration"
 	"github.com/scttfrdmn/agenkit-runtime/pkg/pool"
 	"github.com/scttfrdmn/agenkit-runtime/pkg/snapshot"
 )
 
 func serveCmd() *cobra.Command {
-	return &cobra.Command{
+	var logLevel string
+	var metricsAddr string
+
+	cmd := &cobra.Command{
 		Use:   "serve",
 		Short: "Start the agenkit-runtime host daemon",
 		Long: `serve starts the long-running daemon that:
@@ -31,12 +38,40 @@ func serveCmd() *cobra.Command {
   - Accepts vsock connections from guest agents
   - Provides a Unix-socket management API for CLI sub-commands`,
 		RunE: func(cmd *cobra.Command, args []string) error {
-			return runServe(cmd.Context())
+			return runServe(cmd.Context(), logLevel, metricsAddr)
 		},
 	}
+
+	cmd.Flags().StringVar(&logLevel, "log-level", "info", "Log level: debug, info, warn, error")
+	cmd.Flags().StringVar(&metricsAddr, "metrics-addr", ":9090", "Address for the Prometheus /metrics endpoint")
+	return cmd
 }
 
-func runServe(ctx context.Context) error {
+func runServe(ctx context.Context, logLevelStr string, metricsAddr string) error {
+	// Configure structured JSON logging.
+	var level slog.Level
+	switch logLevelStr {
+	case "debug":
+		level = slog.LevelDebug
+	case "warn":
+		level = slog.LevelWarn
+	case "error":
+		level = slog.LevelError
+	default:
+		level = slog.LevelInfo
+	}
+	slog.SetDefault(slog.New(slog.NewJSONHandler(os.Stderr, &slog.HandlerOptions{Level: level})))
+
+	// Register and start Prometheus metrics endpoint.
+	metrics.Register()
+	mux := http.NewServeMux()
+	mux.Handle("/metrics", promhttp.Handler())
+	go func() {
+		if err := http.ListenAndServe(metricsAddr, mux); err != nil {
+			slog.Error("metrics server stopped", "err", err)
+		}
+	}()
+
 	cfg, err := config.LoadConfig(cfgFile)
 	if err != nil {
 		return err
@@ -44,12 +79,12 @@ func runServe(ctx context.Context) error {
 
 	state, err := config.LoadState(config.DefaultStatePath)
 	if err != nil {
-		log.Printf("WARNING: failed to load cluster state: %v (starting fresh)", err)
+		slog.Warn("failed to load cluster state, starting fresh", "err", err)
 		state = &config.ClusterState{Hosts: make(map[string]*config.HostState)}
 	}
 
-	log.Printf("INFO: agenkit-runtime serve starting with %d host(s)", len(cfg.Hosts))
-	log.Printf("INFO: cluster state: %d known hosts", len(state.Hosts))
+	slog.Info("serve starting", "hosts", len(cfg.Hosts))
+	slog.Info("cluster state loaded", "known_hosts", len(state.Hosts))
 
 	// Build per-host pools from state and pre-warm slots that were ready
 	// at last shutdown (as recorded in VMStates).
@@ -58,12 +93,6 @@ func runServe(ctx context.Context) error {
 		p := pool.NewPool(hs.PoolSize)
 		pools[addr] = p
 
-		// Pre-warm: transition slots from absent→provisioned→ready for every
-		// slot that was in the "ready" state at last shutdown (as persisted
-		// in VMStates).  PID 0 is used as a placeholder — the real PID is
-		// not known until the Firecracker process is (re-)started, which is
-		// handled by the provisioning flow.  This restores pool availability
-		// so the daemon can accept sessions immediately after a restart.
 		for i, stateStr := range hs.VMStates {
 			if i >= p.Size() {
 				break
@@ -72,14 +101,14 @@ func runServe(ctx context.Context) error {
 				continue
 			}
 			if provErr := p.VM(i).Provision(0); provErr != nil {
-				log.Printf("WARNING: pre-warm slot %d on %s: provision: %v", i, addr, provErr)
+				slog.Warn("pre-warm slot provision failed", "slot", i, "host", addr, "err", provErr)
 				continue
 			}
 			if markErr := p.VM(i).MarkReady(); markErr != nil {
-				log.Printf("WARNING: pre-warm slot %d on %s: mark ready: %v", i, addr, markErr)
+				slog.Warn("pre-warm slot mark-ready failed", "slot", i, "host", addr, "err", markErr)
 				continue
 			}
-			log.Printf("INFO: pre-warmed pool slot %d on %s (was ready at last shutdown)", i, addr)
+			slog.Info("pre-warmed pool slot", "slot", i, "host", addr)
 		}
 	}
 
@@ -96,17 +125,35 @@ func runServe(ctx context.Context) error {
 
 	store, err := snapshot.NewStoreFromURL(monCtx, snapshotDir)
 	if err != nil {
-		log.Printf("WARNING: failed to create snapshot store at %s: %v", snapshotDir, err)
+		slog.Warn("failed to create snapshot store", "path", snapshotDir, "err", err)
 	}
 	var snapshotMgr *snapshot.Manager
 	if store != nil {
 		snapshotMgr = snapshot.NewManager(store, os.TempDir())
 	}
 
+	// Background goroutine: update PoolVMSlots gauge every 15 seconds.
+	go func() {
+		ticker := time.NewTicker(15 * time.Second)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-monCtx.Done():
+				return
+			case <-ticker.C:
+				for addr, p := range pools {
+					for state, count := range p.Stats() {
+						metrics.PoolVMSlots.WithLabelValues(addr, string(state)).Set(float64(count))
+					}
+				}
+			}
+		}
+	}()
+
 	// Start the spot monitor (no-op on non-EC2).
 	manifestDir := snapshotDir + "/manifests"
 	spotMon := migration.NewSpotMonitor(func(deadline time.Time) {
-		log.Printf("WARNING: spot interruption detected, deadline %s — initiating migration", deadline)
+		slog.Warn("spot interruption detected, initiating migration", "deadline", deadline)
 
 		// Collect active sessions and vsock addresses from all pools.
 		activeSessions := make(map[int]string)
@@ -118,19 +165,19 @@ func runServe(ctx context.Context) error {
 			}
 		}
 		if len(activeSessions) == 0 {
-			log.Printf("INFO: spot interruption: no active sessions to migrate")
+			slog.Info("spot interruption: no active sessions to migrate")
 			return
 		}
 
 		// Generate a random migration ID (16 bytes of hex — no external uuid dep).
 		var raw [16]byte
 		if _, err := rand.Read(raw[:]); err != nil {
-			log.Printf("ERROR: migration: failed to generate migration ID: %v", err)
+			slog.Error("migration: failed to generate migration ID", "err", err)
 			return
 		}
 		migrationID := hex.EncodeToString(raw[:])
 
-		// Resolve local host address from config (first host entry as a best-effort default).
+		// Resolve local host address from config.
 		hostAddr := "localhost"
 		if len(cfg.Hosts) > 0 && cfg.Hosts[0].Addr != "" {
 			hostAddr = cfg.Hosts[0].Addr
@@ -147,17 +194,20 @@ func runServe(ctx context.Context) error {
 		go func() {
 			manifest, err := migrator.MigrateAll(monCtx, activeSessions, deadline)
 			if err != nil {
-				log.Printf("ERROR: migration %s: MigrateAll failed: %v", migrationID, err)
+				slog.Error("migration MigrateAll failed", "migration_id", migrationID, "err", err)
 				return
 			}
 			pending := 0
 			for _, s := range manifest.Sessions {
-				if s.Status == "pending" {
+				switch s.Status {
+				case "pending":
 					pending++
+					metrics.MigrationSessionsTotal.WithLabelValues("pending").Inc()
+				case "failed":
+					metrics.MigrationSessionsTotal.WithLabelValues("failed").Inc()
 				}
 			}
-			log.Printf("INFO: migration %s complete: %d/%d sessions pending recovery",
-				migrationID, pending, len(manifest.Sessions))
+			slog.Info("migration complete", "migration_id", migrationID, "pending", pending, "total", len(manifest.Sessions))
 		}()
 	})
 
@@ -181,7 +231,7 @@ func runServe(ctx context.Context) error {
 
 	go func() {
 		if err := srv.Serve(monCtx); err != nil {
-			log.Printf("WARNING: api server error: %v", err)
+			slog.Warn("api server error", "err", err)
 		}
 	}()
 
@@ -190,7 +240,7 @@ func runServe(ctx context.Context) error {
 	signal.Notify(sigCh, syscall.SIGTERM, syscall.SIGINT)
 	select {
 	case sig := <-sigCh:
-		log.Printf("INFO: received signal %s, shutting down", sig)
+		slog.Info("received signal, shutting down", "signal", sig)
 	case <-ctx.Done():
 	}
 
@@ -209,13 +259,13 @@ func runServe(ctx context.Context) error {
 	drainCtx, drainCancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer drainCancel()
 	for addr, p := range pools {
-		log.Printf("INFO: draining pool for host %s (%d active sessions)", addr, len(p.ActiveSessions()))
+		slog.Info("draining pool", "host", addr, "active_sessions", len(p.ActiveSessions()))
 		p.Drain(drainCtx, pool.DrainGraceful)
 	}
 
 	// Persist final state.
 	if err := config.SaveState(config.DefaultStatePath, state); err != nil {
-		log.Printf("WARNING: failed to save cluster state on shutdown: %v", err)
+		slog.Warn("failed to save cluster state on shutdown", "err", err)
 	}
 	return nil
 }

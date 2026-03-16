@@ -7,6 +7,41 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-03-15
+
+### Added
+
+#### Unit Tests — Issue #11
+- **`pkg/pool/pool_test.go`**: 7 tests covering VM state machine transitions,
+  invalid transitions, `Acquire`/release cycle, `Stats()`, `ActiveSessions()`,
+  `Drain()`, and `Available()` count
+- **`pkg/migration/migrator_test.go`**: 4 tests using TCP listeners as fake vsock
+  responders — success path, guest error (OOM), manifest persistence, and
+  context cancellation; all run on macOS and Linux
+- **`pkg/vsock/bus_test.go`**: 3 tests — `RequestCheckpoint` round-trip,
+  `HostSignal` marshal/unmarshal fidelity, and timeout when guest hangs
+- **`pkg/snapshot/store_test.go`**: 3 tests — `NewStoreFromURL` with local path
+  returns `*LocalStore`; S3 URL returns `*S3SnapshotStore` (skipped in `-short`
+  mode); empty URL returns an error
+
+#### Structured Logging — Issue #12
+- **`cmd/internal/serve.go`**: Replaced all `log.Printf` calls with structured
+  `slog` calls (`slog.Info`, `slog.Warn`, `slog.Error`)
+- JSON log handler (`slog.NewJSONHandler`) enabled at startup for
+  machine-readable structured output
+- New `--log-level` flag (debug / info / warn / error, default: info)
+
+#### Prometheus Metrics — Issue #12
+- **`pkg/metrics/metrics.go`**: New package exporting three Prometheus metrics:
+  `agenkit_pool_vm_slots` (gauge, per host+state),
+  `agenkit_migration_sessions_total` (counter, by outcome),
+  `agenkit_snapshot_ops_total` (counter, by operation+status)
+- New `--metrics-addr` flag (default `:9090`); HTTP `/metrics` endpoint served
+  via `promhttp.Handler`
+- Background goroutine (15s ticker) updates `PoolVMSlots` gauge from pool stats
+- Migration session outcomes increment `MigrationSessionsTotal` counter
+- New dependency: `github.com/prometheus/client_golang v1.23.2`
+
 ## [0.3.0] - 2026-03-15
 
 ### Added
