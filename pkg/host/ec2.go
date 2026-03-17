@@ -103,7 +103,7 @@ func (h *EC2Host) Provision(ctx context.Context, provCfg ProvisionConfig) error 
 	if err != nil {
 		return fmt.Errorf("ssh connect to new instance: %w", err)
 	}
-	defer conn.Close()
+	defer func() { _ = conn.Close() }()
 
 	return provision.Bootstrap(ctx, conn, provision.BootstrapConfig{
 		KernelPath:          provCfg.KernelPath,

@@ -8,9 +8,8 @@ import (
 
 // Pool manages a fixed-size array of VM slots on a single host.
 type Pool struct {
-	mu   sync.Mutex
-	vms  []*VM
-	warm int // target number of pre-started VMs in the ready state
+	mu  sync.Mutex
+	vms []*VM
 }
 
 // NewPool creates a Pool with size VM slots.

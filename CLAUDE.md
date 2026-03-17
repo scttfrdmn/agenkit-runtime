@@ -72,67 +72,66 @@ CLI / external caller
             └─ Firecracker process already running (pid stored in VM)
 ```
 
-### IPC: CLI ↔ Daemon (NOT YET IMPLEMENTED)
+### IPC: CLI ↔ Daemon
 
-The `serve` daemon must expose a Unix socket at `/var/run/agenkit/runtime.sock`.
-CLI subcommands (`host add`, `cluster status`, etc.) connect to this socket.
-See GitHub issue #1 for the full spec.
+The `serve` daemon exposes a Unix socket at `/var/run/agenkit/runtime.sock`.
+CLI subcommands (`host add`, `cluster status`, etc.) connect to this socket
+via `pkg/api`. Implemented in v0.1.0.
 
 ---
 
 ## Integration with agenkit-go
 
-These types from `github.com/scttfrdmn/agenkit-go/checkpointing` are used by
-the `recover` command. They are **not imported** — they are called through an
-interface that must be kept in sync manually.
+`agenkit-runtime` does not import `agenkit-go` directly. The vsock bridge is
+the integration point: when `recover` runs, it sends `resume_migrated` signals
+over vsock to running VM slots. The guest's agenkit-go agent handles the signal
+and calls `DurableAgent.ResumeMigrated` internally.
 
-| agenkit-go type | Used where | Purpose |
-|-----------------|-----------|---------|
-| `DurableAgent.ResumeMigrated(ctx, MigrationContext)` | `cmd/internal/recover.go` | Resume an agent session from a checkpoint after spot eviction |
-| `MigrationContext` | `pkg/migration/manifest.go` | Carries `SourceHost`, `CheckpointID`, `SessionID`, `MigrationID` to the agent |
-| `SharedCheckpointStorage` | `pkg/snapshot/store.go` | Marker interface — `LocalStore` and future `S3Store` must satisfy it |
-
-The bridge: when `recover` runs, for each `SessionMigration` with `Status=="pending"`,
-it constructs a `MigrationContext` from the manifest and calls into the agenkit-go
-library (via subprocess or RPC, TBD in issue #5).
+| vsock signal | Used where | Purpose |
+|-------------|-----------|---------|
+| `resume_migrated` | `cmd/internal/recover.go` → `pkg/vsock/bus.RequestResume` | Ask a fresh guest to restore a checkpointed session |
+| `checkpoint_now` | `pkg/migration/migrator.go` → `pkg/vsock/bus.RequestCheckpoint` | Ask a running guest to create a checkpoint |
 
 ---
 
-## Stubs Inventory
+## Current Implementation State (v0.5.0)
 
-Every unimplemented piece with exact file + line:
+### Implemented ✅
 
-### Critical Path (must implement first)
+| Feature | Package | Notes |
+|---------|---------|-------|
+| Unix socket management API | `pkg/api/` | Serve + CLI IPC |
+| Host/cluster/snapshot commands | `cmd/internal/` | Wired end-to-end |
+| Session recovery (manifest) | `cmd/internal/recover.go` | Reads manifests + vsock bridge |
+| Manifest persistence | `pkg/migration/migrator.go` | Atomic write on eviction |
+| Firecracker snapshot UDS API | `pkg/snapshot/manager.go` | Pause → snapshot → resume |
+| S3 snapshot store | `pkg/snapshot/s3store.go` | Multipart upload/download |
+| VM pool wiring | `cmd/internal/serve.go` | Pre-warm, drain on SIGTERM |
+| Unit + integration tests | `*_test.go` | 17 tests across 4 packages |
+| Structured logging (slog) | `cmd/internal/serve.go` | JSON handler + log level flag |
+| Prometheus metrics | `pkg/metrics/` | pool slots, migration outcomes |
+| Firecracker process spawning | `pkg/pool/vm.go` (`Spawn`) | Config JSON + socket health-check |
+| ResumeMigrated vsock bridge | `pkg/vsock/bus.go`, `recover.go` | `resume_migrated` signal + ack |
 
-| # | File | Line(s) | Description |
-|---|------|---------|-------------|
-| 1 | `cmd/internal/serve.go` | 50 | `OnInterruption` callback: TODO comment, no MigrateAll call |
-| 2 | `cmd/internal/serve.go` | — | No Unix socket IPC listener (entire feature missing) |
-| 3 | `pkg/snapshot/manager.go` | 26–42 | `Build()` writes JSON marker file only; no Firecracker UDS call |
+### Remaining Operational Prerequisites (not code stubs)
 
-### Host & Cluster Commands (all stubs)
+These require infrastructure setup, not code changes:
 
-| # | File | Line(s) | Description |
-|---|------|---------|-------------|
-| 4 | `cmd/internal/host.go` | 32–97 | All 5 host subcommands print messages only |
-| 5 | `cmd/internal/cluster.go` | 27–52 | `provision` and `teardown` print messages only |
-| 6 | `cmd/internal/snapshot.go` | 35–57 | `push` and `pull` print messages only |
+1. **Base snapshot build**: A pre-built kernel + rootfs must exist at the paths
+   configured in `cluster.yaml` (`kernel_path`). Production build instructions
+   are out of scope for this repo.
 
-### Session Recovery
+2. **TAP device / networking**: Firecracker requires TAP devices for guest
+   networking. Setup (`ip tuntap add`, `bridge` config) is host provisioning
+   work done by `pkg/provision/` during `cluster provision`.
 
-| # | File | Line(s) | Description |
-|---|------|---------|-------------|
-| 7 | `cmd/internal/recover.go` | 38–44 | Prints "Recovery complete" — no manifest reading, no ResumeMigrated call |
-| 8 | `pkg/migration/migrator.go` | — | `MigrateAll` never writes manifest to disk; manifests lost on crash |
+3. **Real vsock (Linux only)**: `pkg/vsock/bus.go` currently uses TCP as a
+   fallback. On production Linux hosts with `vhost-vsock` loaded, the dialer
+   should use `AF_VSOCK`. A follow-on issue tracks this.
 
-### Missing Entirely
-
-| # | What | Description |
-|---|------|-------------|
-| 9 | `pkg/api/` | Unix socket management API (new package needed) |
-| 10 | `pkg/snapshot/s3store.go` | S3-backed SnapshotStore (new file needed) |
-| 11 | `*_test.go` | No tests anywhere in repo |
-| 12 | Structured logging + metrics | `serve.go` uses `log.Printf` throughout |
+4. **EC2 nested-virt verification**: The `pkg/host/ec2.go` uses the `metal`
+   instance type pattern for nested virtualization. Verify the correct AWS API
+   field for the Feb 2026 SDK version before production use.
 
 ---
 

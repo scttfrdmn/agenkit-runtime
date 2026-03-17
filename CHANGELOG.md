@@ -7,6 +7,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.0] - 2026-03-17
+
+### Added
+
+#### Firecracker Process Spawning
+- **`pkg/pool/vm.go`**: `Spawn(ctx, firecrackerBin, kernelPath, rootfsPath, socketPath)`
+  launches a Firecracker process, writes per-slot config JSON to
+  `/tmp/fc-config-{slot}.json`, polls for socket readiness (up to 2s),
+  then calls `Provision(pid)` → `MarkReady()`
+- Config JSON includes: `boot-source`, `drives` (rootfs), `machine-config`
+  (2 vCPU / 256 MiB), and `vsock` (guest CID = slot+3)
+- **`pkg/pool/vm_spawn_test.go`**: 3 new tests — success path (config fields +
+  state transitions), failure path (binary exits 1 → VM stays absent),
+  socket timeout (binary exits 0 but no socket → VM stays absent)
+
+#### ResumeMigrated Bridge
+- **`pkg/vsock/protocol.go`**: Added `SignalResumeMigrated` signal type; added
+  `CheckpointID` field to `HostSignal` (used for resume signals)
+- **`pkg/vsock/bus.go`**: Added `RequestResume(ctx, checkpointID, migrationID,
+  deadlineSec)` — sends `resume_migrated` signal and waits for guest ack
+- **`cmd/internal/recover.go`**: Replaced "unrecoverable" stub with a real
+  vsock bridge — pending sessions now trigger a `resume_migrated` signal to
+  an acquired pool slot; manifest updated to `resumed` or `failed` (with
+  error detail); no sessions are silently discarded
+
+#### Integration Test
+- **`cmd/integration_test.go`**: Local cluster lifecycle test (provision → assign →
+  drain → deprovision) using `mockSpawn` (no real Firecracker binary required);
+  run with `go test -tags integration ./cmd/...`
+
 ## [0.4.0] - 2026-03-15
 
 ### Added

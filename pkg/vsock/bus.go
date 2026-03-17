@@ -96,5 +96,44 @@ func (b *Bus) RequestCheckpoint(ctx context.Context, reason, migrationID string,
 	}
 }
 
+// RequestResume sends a resume_migrated signal and waits for the ack.
+// checkpointID identifies the checkpoint the guest should restore.
+// Returns nil on success (ack received without error).
+func (b *Bus) RequestResume(ctx context.Context, checkpointID, migrationID string, deadlineSec int) error {
+	sig := HostSignal{
+		Type:         SignalResumeMigrated,
+		Reason:       "migration",
+		CheckpointID: checkpointID,
+		MigrationID:  migrationID,
+		DeadlineSec:  deadlineSec,
+	}
+	if err := b.SendSignal(sig); err != nil {
+		return err
+	}
+
+	type ackResult struct {
+		ack *GuestAck
+		err error
+	}
+	ch := make(chan ackResult, 1)
+	go func() {
+		ack, err := b.ReceiveAck()
+		ch <- ackResult{ack, err}
+	}()
+
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case r := <-ch:
+		if r.err != nil {
+			return r.err
+		}
+		if r.ack.Error != "" {
+			return fmt.Errorf("guest resume error: %s", r.ack.Error)
+		}
+		return nil
+	}
+}
+
 // Close closes the underlying connection.
 func (b *Bus) Close() error { return b.conn.Close() }

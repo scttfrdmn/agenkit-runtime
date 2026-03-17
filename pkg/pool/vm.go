@@ -3,7 +3,10 @@ package pool
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
+	"os"
+	"os/exec"
 	"sync"
 	"time"
 )
@@ -150,6 +153,134 @@ func (v *VM) Drain(ctx context.Context, mode DrainMode) (<-chan struct{}, error)
 	}()
 
 	return done, nil
+}
+
+// fcConfig is the per-VM Firecracker JSON configuration written to disk.
+type fcConfig struct {
+	BootSource    fcBootSource `json:"boot-source"`
+	Drives        []fcDrive   `json:"drives"`
+	MachineConfig fcMachine   `json:"machine-config"`
+	Vsock         fcVsock     `json:"vsock"`
+}
+
+type fcBootSource struct {
+	KernelImagePath string `json:"kernel_image_path"`
+	BootArgs        string `json:"boot_args"`
+}
+
+type fcDrive struct {
+	DriveID      string `json:"drive_id"`
+	PathOnHost   string `json:"path_on_host"`
+	IsRootDevice bool   `json:"is_root_device"`
+	IsReadOnly   bool   `json:"is_read_only"`
+}
+
+type fcMachine struct {
+	VcpuCount  int `json:"vcpu_count"`
+	MemSizeMib int `json:"mem_size_mib"`
+}
+
+type fcVsock struct {
+	GuestCID int    `json:"guest_cid"`
+	UDSPath  string `json:"uds_path"`
+}
+
+// Spawn launches a Firecracker process for this slot and transitions
+// the VM from absent/deprovisioned → provisioned → ready.
+//
+// Parameters:
+//   - firecrackerBin: path to the firecracker binary
+//   - kernelPath:     path to the Linux kernel image
+//   - rootfsPath:     path to the rootfs ext4 image (base snapshot)
+//   - socketPath:     path for the Firecracker management socket
+func (v *VM) Spawn(ctx context.Context, firecrackerBin, kernelPath, rootfsPath, socketPath string) error {
+	// Write per-slot Firecracker config JSON.
+	configPath := fmt.Sprintf("/tmp/fc-config-%d.json", v.slotIndex)
+	cfg := fcConfig{
+		BootSource: fcBootSource{
+			KernelImagePath: kernelPath,
+			BootArgs:        "console=ttyS0 reboot=k panic=1 pci=off",
+		},
+		Drives: []fcDrive{{
+			DriveID:      "rootfs",
+			PathOnHost:   rootfsPath,
+			IsRootDevice: true,
+			IsReadOnly:   false,
+		}},
+		MachineConfig: fcMachine{VcpuCount: 2, MemSizeMib: 256},
+		Vsock: fcVsock{
+			GuestCID: v.slotIndex + 3,
+			UDSPath:  socketPath + ".vsock",
+		},
+	}
+	data, err := json.MarshalIndent(cfg, "", "  ")
+	if err != nil {
+		return fmt.Errorf("vm slot %d: marshal firecracker config: %w", v.slotIndex, err)
+	}
+	if err := os.WriteFile(configPath, data, 0600); err != nil {
+		return fmt.Errorf("vm slot %d: write firecracker config: %w", v.slotIndex, err)
+	}
+
+	// Start the Firecracker process.
+	cmd := exec.CommandContext(ctx, firecrackerBin,
+		"--no-api",
+		"--config-file", configPath,
+		"--api-sock", socketPath,
+	)
+
+	if err := cmd.Start(); err != nil {
+		return fmt.Errorf("vm slot %d: start firecracker: %w", v.slotIndex, err)
+	}
+	pid := cmd.Process.Pid
+
+	// Watch for process exit in a goroutine.
+	cmdDone := make(chan error, 1)
+	go func() {
+		cmdDone <- cmd.Wait()
+	}()
+
+	// Health-check: poll for the socket file to appear (up to 2 seconds).
+	const pollInterval = 100 * time.Millisecond
+	const socketTimeout = 2 * time.Second
+	deadline := time.Now().Add(socketTimeout)
+
+	for {
+		if _, statErr := os.Stat(socketPath); statErr == nil {
+			break // socket appeared — VM is accepting connections
+		}
+
+		// Check if the process exited with an error before the socket appeared.
+		select {
+		case exitErr := <-cmdDone:
+			if exitErr != nil {
+				return fmt.Errorf("vm slot %d: firecracker exited before ready: %w", v.slotIndex, exitErr)
+			}
+			// Exited 0 without creating socket — not an error by itself; keep polling.
+		default:
+		}
+
+		if time.Now().After(deadline) {
+			_ = cmd.Process.Kill()
+			return fmt.Errorf("vm slot %d: timed out waiting for firecracker socket %s", v.slotIndex, socketPath)
+		}
+
+		select {
+		case <-ctx.Done():
+			_ = cmd.Process.Kill()
+			return ctx.Err()
+		case <-time.After(pollInterval):
+		}
+	}
+
+	// Socket appeared — record the PID and mark the slot ready.
+	if err := v.Provision(pid); err != nil {
+		_ = cmd.Process.Kill()
+		return fmt.Errorf("vm slot %d: provision after spawn: %w", v.slotIndex, err)
+	}
+	if err := v.MarkReady(); err != nil {
+		return fmt.Errorf("vm slot %d: mark ready after spawn: %w", v.slotIndex, err)
+	}
+	return nil
 }
 
 // Deprovision moves the VM from idle to deprovisioned.

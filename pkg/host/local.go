@@ -25,7 +25,7 @@ func (h *LocalHost) Provision(ctx context.Context, cfg ProvisionConfig) error {
 	if err != nil {
 		return fmt.Errorf("provision: ssh dial %s: %w", h.addr, err)
 	}
-	defer conn.Close()
+	defer func() { _ = conn.Close() }()
 	return provision.Bootstrap(ctx, conn, provision.BootstrapConfig{
 		KernelPath:          cfg.KernelPath,
 		SnapshotStore:       cfg.SnapshotStore,

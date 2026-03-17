@@ -23,9 +23,20 @@ func NewStoreFromURL(ctx context.Context, rawURL string) (SnapshotStore, error) 
 		if len(parts) == 2 {
 			prefix = parts[1]
 		}
-		return NewS3Store(ctx, bucket, prefix)
+		// Use an intermediate variable so that a nil *S3SnapshotStore is not
+		// wrapped into a non-nil SnapshotStore interface on error.
+		s, err := NewS3Store(ctx, bucket, prefix)
+		if err != nil {
+			return nil, err
+		}
+		return s, nil
 	}
-	return NewLocalStore(rawURL)
+	// Same pattern for LocalStore: avoid the nil-interface trap.
+	ls, err := NewLocalStore(rawURL)
+	if err != nil {
+		return nil, err
+	}
+	return ls, nil
 }
 
 // SnapshotStore is the interface for storing and retrieving Firecracker snapshots.

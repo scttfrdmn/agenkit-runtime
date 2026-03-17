@@ -123,12 +123,10 @@ func runServe(ctx context.Context, logLevelStr string, metricsAddr string) error
 	monCtx, monCancel := context.WithCancel(ctx)
 	defer monCancel()
 
-	store, err := snapshot.NewStoreFromURL(monCtx, snapshotDir)
-	if err != nil {
-		slog.Warn("failed to create snapshot store", "path", snapshotDir, "err", err)
-	}
 	var snapshotMgr *snapshot.Manager
-	if store != nil {
+	if store, storeErr := snapshot.NewStoreFromURL(monCtx, snapshotDir); storeErr != nil {
+		slog.Warn("failed to create snapshot store", "path", snapshotDir, "err", storeErr)
+	} else {
 		snapshotMgr = snapshot.NewManager(store, os.TempDir())
 	}
 
